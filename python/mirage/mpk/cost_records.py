@@ -184,6 +184,9 @@ def records_of_run(pk, schedule_paths: List[str], launches: List[Tuple[list, lis
     gating = set() if pool is None else {p.graph_idx for p in (producer_of(t, list(nodes.values())) for t in nodes[pool].inputs) if p}
     key_of = lambda n: cost_key(n, n.grid, producer_grids(n, list(nodes.values())))
     records = records_from_run(schedules, launches, nodes, key_of, pool, gating, run, machine)
+    # The current code tag omits nested GQA and external compiler dependencies.
+    # Keep unrelated records from mixed graphs while declining GQA records.
+    records = [r for r in records if r.get("task_type") not in ("gqa_paged_parts", "gqa_merge_ready", "gqa_direct")]
     tag = code_tag()
     for r in records:
         r["code"] = tag   # the kernel templates these times were measured with

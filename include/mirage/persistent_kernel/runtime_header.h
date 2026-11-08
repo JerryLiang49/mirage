@@ -296,6 +296,8 @@ enum TaskType {
   // mHC's post step of a TP sublayer and the first half of the next
   // sublayer's pre step in one task (tasks/hc_post_mix.cuh).
   TASK_HC_POST_MIX_SM100 = 530,
+  TASK_GQA_PAGED_PARTS_SM100 = 543, // experimental static preprocessed GQA
+  TASK_GQA_MERGE_READY_SM100 = 544,
   TASK_STATIC_TASK_END = 549, // end placeholder, not a real task
 };
 

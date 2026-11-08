@@ -299,6 +299,85 @@ class StaticMegakernel(PersistentKernel):
             args[f"pf.{i}"] = f"t:{names[t.guid]} {b}"
         return args
 
+    def paged_gqa_decode_layer(self, query, keys, values, pages, lengths, windows,
+                               new_keys, new_values, output, sinks=None, partition_tokens=4160, direct_output=False, implementation="sm100"):
+        """Experimental preprocessed decode: eight independent requests.
+
+        BF16 query [8,8,8,128], output [8,8192], page64 caches [P,64,8,128].
+        The request-parallel SM100 path supports capacity129. A partition_tokens
+        value of4160 selects two producers with a page-aligned split adapted to
+        each request's visible history. A value of8256 selects one producer.
+        Positive window W includes last W keys; zero means all history.
+        Appends new KV at lengths-1. Requests must exclusively own physical
+        pages. This declaration does not validate changing device metadata or
+        physical binding aliasing; guarded compilation is a separate gate.
+        Callers must finish and order prior writes to pages, lengths, and windows
+        before validation, and prevent concurrent writes from validation
+        until launch or graph replay completes. The process-local
+        lease does not enforce this requirement against external mutations.
+        Callers must also keep tensor storage, shape, and strides unchanged
+        throughout compilation, initialization, and the guarded kernel's
+        lifetime. The wrapper snapshots the mapping, not mutable tensor state.
+        """
+        from .paged_gqa_contract import validate_specs
+        from .compiler import graph_nodes, producer_of
+        if self.num_gpus != 1:
+            raise ValueError("paged GQA currently supports one GPU")
+        if getattr(self, "_paged_gqa_contract", None) is not None:
+            raise ValueError("one exclusive paged GQA cache owner per graph")
+        roles = dict(query=query, keys=keys, values=values, pages=pages,
+                     lengths=lengths, windows=windows, new_keys=new_keys,
+                     new_values=new_values, output=output)
+        if sinks is not None:
+            roles["sinks"] = sinks
+        specs = {}
+        for role, tensor in roles.items():
+            dtype_name = "bfloat16" if tensor.dtype == bfloat16 else "int32" if tensor.dtype == int32 else "unsupported"
+            specs[role] = dict(shape=tuple(tensor.dim(i) for i in range(tensor.num_dims)),
+                               strides=tuple(tensor.stride), dtype=dtype_name)
+        contract = validate_specs(specs,partition_tokens)
+        if implementation != "sm100" or direct_output is not False:
+            raise ValueError("only partitioned sm100 GQA is supported")
+        if self.num_sms != 128:
+            raise ValueError("experimental sm100 GQA requires 128 workers")
+        shape = tuple(contract[x] for x in ("groups", "heads", "dim", "page_capacity"))
+        if shape != (8, 8, 128, 129) or contract["chunk_size"] not in (4160, 8256):
+            raise ValueError("experimental sm100 requires G8/H8/D128, page64, capacity129 and partition_tokens4160 or8256")
+        if len({t.guid for t in roles.values()}) != len(roles):
+            raise ValueError("distinct tensor descriptors required")
+        nodes = graph_nodes(self)
+        if any(producer_of(t, nodes) is not None for t in roles.values()):
+            raise ValueError("initial paged GQA path requires graph inputs")
+        cache_ids = {keys.guid, values.guid}
+        if any(t.guid in cache_ids for node in nodes for t in node.inputs + node.outputs):
+            raise ValueError("cache is already used by another graph node")
+        if len(self._bufs) + 14 > getattr(self, "max_bufs", MAX_BUFS):
+            raise ValueError("insufficient buffer slots for paged GQA")
+        self._tokens(8)
+        g,h,d,k,np = (contract[x] for x in ("groups","heads","dim","chunks","page_capacity"))
+        partial = self.new_tensor((8,g,k,h*d), dtype=bfloat16, name="paged_gqa_partial")
+        lse = self._scratch("paged_gqa_lse", 8*g*k*h*4, 0xFF)
+        slots = [lse] + [self._tensor_slot(roles[r]) for r in
+                         ("query","keys","values","pages","lengths","windows","new_keys","new_values")]
+        ins = [roles[r] for r in ("query","keys","values","pages","lengths","windows","new_keys","new_values")]
+        self._add_node("gqa_paged_parts", (g,k,8), (256,1,1), ins+[partial],
+                       [(-1,-1,-1)]*8+[(1,2,0)], [g,h,d,k,contract["chunk_size"],64,np],
+                       out_buffer=lambda n: (8*g*k*h*d*2, 0xFF, False),
+                       counters=g, buf_slots=slots)
+        producer = max(self._static_nodes)
+        merge_inputs = [partial] + ([] if sinks is None else [sinks])
+        self._add_node("gqa_merge_ready", (g,1,8), (256,1,1), merge_inputs+[output],
+                       [(1,-1,-1)] + ([] if sinks is None else [(-1,-1,-1)]) + [(1,-1,0)],
+                       [g,h,d,k,int(sinks is not None)],
+                       out_buffer=lambda n: (8*g*h*d*2, -1, False),
+                       counters=1, buf_slots=[lse, -1 if sinks is None else self._tensor_slot(sinks)])
+        contract.update(implementation=implementation,producer=producer, merge=max(self._static_nodes),
+                        names={role:self._tensor_names[t.guid] for role,t in roles.items()},
+                        cache_guids=cache_ids,
+                        tensor_guids={role:t.guid for role,t in roles.items()},
+                        specs=specs)
+        self._paged_gqa_contract = contract
+
     def gemm_tile_layer(
         self,
         input: DTensor,     # [T, K] bf16
@@ -1341,14 +1420,14 @@ class StaticMegakernel(PersistentKernel):
 
     # ---- the generated layer (static_schedule.py) ----
     def compile_static(self, schedule_paths, gpu_tensors=None, out_dir=None, extra_flags=None, profile=False, device=0,
-                       rank=None, exchange=None):
+                       rank=None, exchange=None, cooperative_gqa=False):
         """Build the graph as it is now, one schedule.json per GPU (static_schedule.compile_static); profile: the timing build
         (per-task start / end stamps, static_harness.Harness.task_times); device: the CUDA device of GPU 0. rank / exchange:
         GPU `rank` alone in this process with the caller's exchange region (multicast address, local address), e.g. one
         TP rank of a serving framework (exchange_region_bytes)."""
         from .static_schedule import compile_static
         return compile_static(self, schedule_paths, gpu_tensors, out_dir, extra_flags=extra_flags, profile=profile,
-                              device=device, rank=rank, exchange=exchange)
+                              device=device, rank=rank, exchange=exchange, cooperative_gqa=cooperative_gqa)
 
     def exchange_region_bytes(self) -> int:
         """The exchange region a rank-alone build needs from its caller (compile_static rank / exchange): both sets."""

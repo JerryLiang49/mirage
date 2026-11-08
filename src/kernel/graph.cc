@@ -1126,6 +1126,15 @@ void Graph::register_task_for_op(KNOperator const *op,
         customized->bgraph, params);
     task_config[op] =
         std::make_tuple(1, 1, TASK_DSA_O_ABSORB_SM100, variant_id);
+  } else if (name == "gqa_paged_parts") {
+    int id = task_register->register_gqa_paged_parts_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(8, 1, TASK_GQA_PAGED_PARTS_SM100, id);
+  } else if (name == "gqa_merge_ready") {
+    int id = task_register->register_gqa_merge_ready_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(1 + params[4], 1, TASK_GQA_MERGE_READY_SM100, id);
   } else if (name == "scaled_moe_experts") {
     int variant_id = task_register->register_scaled_moe_experts_sm100_task(
         customized->bgraph, params);

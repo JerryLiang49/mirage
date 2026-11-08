@@ -5907,5 +5907,34 @@ int TaskRegister::register_kda_decode_sm100_task(
                               params.size());
 }
 
+int TaskRegister::register_gqa_paged_parts_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 7 && params[0] > 0 && params[1] == 8);
+  assert((params[2] == 64 || params[2] == 128) && params[3] > 0);
+  assert(params[4] >= 64 && params[4] <= 32768 && params[4] % 64 == 0 &&
+         params[5] == 64 && params[6] > 0);
+  assert(params[3] == (params[6] * params[5] + params[4] - 1) / params[4]);
+  return register_static_task(this,
+                              TASK_GQA_PAGED_PARTS_SM100,
+                              "gqa_paged_parts",
+                              bgraph,
+                              params,
+                              8,
+                              7);
+}
+int TaskRegister::register_gqa_merge_ready_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 5 && params[0] > 0 && params[1] == 8);
+  assert((params[2] == 64 || params[2] == 128) && params[3] > 0);
+  assert(params[4] == 0 || params[4] == 1);
+  return register_static_task(this,
+                              TASK_GQA_MERGE_READY_SM100,
+                              "gqa_merge_ready",
+                              bgraph,
+                              params,
+                              1 + params[4],
+                              5);
+}
+
 } // namespace runtime
 } // namespace mirage

@@ -411,7 +411,8 @@ class Costs:
         for path in ([paths] if isinstance(paths, str) else list(paths or [])):
             if path and os.path.exists(path):
                 with open(path) as f:
-                    self.records += [r for r in json.load(f)["records"] if (code is None or r.get("code") == code)
+                    self.records += [r for r in json.load(f)["records"] if r.get("task_type") not in ("gqa_paged_parts", "gqa_merge_ready", "gqa_direct")
+                                     and (code is None or r.get("code") == code)
                                      and (gpu is None or (r.get("machine") or {}).get("gpu") == gpu)]
 
     def fit(self, task_type: str, key: dict, any_inputs: bool = False) -> Optional[tuple]:

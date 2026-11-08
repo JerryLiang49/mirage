@@ -322,7 +322,7 @@ def cluster_size(schedules: List[dict]) -> int:
     return sizes.pop()
 
 
-def host_code(pk, schedules: List[dict], profile: bool = False) -> List[str]:
+def host_code(pk, schedules: List[dict], profile: bool = False, cooperative_gqa: bool = False) -> List[str]:
     """HOST_CODE with every @NAME@ replaced: the slot args (StaticMegakernel.host_slot_args, e.g. {"buf.0": "out router_logits
     401408 255 1"}), the number of GPUs and of SMs (lists)."""
     args = pk.host_slot_args()
@@ -340,16 +340,103 @@ def host_code(pk, schedules: List[dict], profile: bool = False) -> List[str]:
         "@BEGINS@": ", ".join(f"static_list_begin_gpu{g}" for g in range(num_gpus)),
         "@PROFILE@": "1" if profile else "0", "@SLOTS@": str(TIME_SLOTS), "@WARPS@": str(THREADS // 32),
     }
-    code = HOST_CODE
+    code = cooperative_host_code(HOST_CODE) if cooperative_gqa else HOST_CODE
     for placeholder, value in fill.items():
         code = code.replace(placeholder, value)
     return [code]
 
 
-def generate_code(pk, schedules: List[dict], profile: bool = False) -> str:
+def cooperative_host_code(code: str) -> str:
+    """Replace only the generated launch entrypoints for the checked GQA mode."""
+    launch = r"""
+#ifndef STATIC_RESET_IN_KERNEL
+#error "cooperative GQA requires device-side reset"
+#endif
+#ifdef STATIC_NO_START_BARRIER
+#error "cooperative GQA requires the start barrier"
+#endif
+static cudaError_t static_launch(size_t flush_bytes) {
+  if (g_st.size() != 1 || flush_bytes != 0) return cudaErrorInvalidValue;
+  StaticGpu &s = g_st[0];
+  cudaError_t err = cudaSetDevice(g_dev0);
+  if (err != cudaSuccess) return err;
+  cudaStreamCaptureStatus capture;
+  if ((err = cudaStreamIsCapturing(s.stream, &capture)) != cudaSuccess) return err;
+  if (capture != cudaStreamCaptureStatusNone) return cudaErrorStreamCaptureUnsupported;
+  int supported = 0, sms = 0, blocks = 0;
+  if ((err = cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, g_dev0)) != cudaSuccess) return err;
+  if (!supported) return cudaErrorNotSupported;
+  if ((err = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, g_dev0)) != cudaSuccess) return err;
+  if ((err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, layer_kernel, @THREADS@, @SMEM@)) != cudaSuccess) return err;
+  if (blocks <= 0 || sms <= 0 || static_mk::NSM > blocks * sms) return cudaErrorCooperativeLaunchTooLarge;
+  if ((err = cudaEventRecord(s.start, s.stream)) != cudaSuccess) return err;
+  void *args[] = { &static_host::g_gpus[0].maps, &static_host::g_gpus[0].g, &s.tasks };
+  if ((err = cudaLaunchCooperativeKernel((void*)layer_kernel, dim3(static_mk::NSM), dim3(@THREADS@), args, @SMEM@, s.stream)) != cudaSuccess) return err;
+  if ((err = cudaEventRecord(s.end, s.stream)) != cudaSuccess) return err;
+  g_launches++;
+  return cudaSuccess;
+}
+
+"""
+    start = code.index('static void static_launch(size_t flush_bytes) {')
+    end = code.index('// one launch on the caller', start)
+    code = code[:start] + launch + code[end:]
+    old = '  static_launch((size_t)flush_bytes);\n  Py_RETURN_NONE;'
+    new = ('  cudaError_t err = static_launch((size_t)flush_bytes);\n'
+           '  if (err != cudaSuccess) { PyErr_Format(PyExc_RuntimeError, "cooperative GQA launch failed: %s", cudaGetErrorString(err)); return NULL; }\n'
+           '  Py_RETURN_NONE;')
+    if code.count(old) != 1:
+        raise RuntimeError('unexpected launch template')
+    code = code.replace(old, new)
+    for name, following in [('py_launch_on_stream', 'py_elapsed'), ('py_launch_stream', 'py_wait')]:
+        start = code.index('static PyObject *' + name + '(')
+        end = code.index('static PyObject *' + following + '(', start)
+        code = code[:start] + ('static PyObject *' + name + '(PyObject *, PyObject *) {\n'
+                               '  PyErr_SetString(PyExc_RuntimeError, "cooperative GQA stream launch and capture are unsupported");\n'
+                               '  return NULL;\n}\n') + code[end:]
+    return code
+
+
+def validate_gqa_schedule(pk, schedules):
+    """Recompute graph tasks/dependencies before accepting a GQA schedule."""
+    from . import compiler
+    if len(schedules) != 1 or pk.num_gpus != 1:
+        raise ValueError("cooperative GQA schedule requires one GPU")
+    schedule = schedules[0]
+    info = schedule.get("info", {})
+    if (not isinstance(info, dict) or type(info.get("gpu")) is not int or info["gpu"] != 0 or
+            type(info.get("cluster_size")) is not int or info["cluster_size"] != 1):
+        raise ValueError("cooperative GQA requires GPU 0 and cluster size one")
+    nodes = compiler.graph_nodes(pk)
+    # JSON canonicalization distinguishes booleans from integer values.
+    canonical = lambda x: json.dumps(x, sort_keys=True, separators=(",", ":"))
+    if canonical(schedule.get("nodes")) != canonical(compiler.node_table(nodes)):
+        raise ValueError("GQA schedule nodes differ from current graph")
+    tasks = compiler.gpu_tasks(pk, nodes, 0, 1)
+    compiler.add_dependencies(tasks)
+    expected = [{"node": t.node, "pos": list(t.pos), "deps": t.deps} for t in tasks]
+    if canonical(schedule.get("all_tasks")) != canonical(expected):
+        raise ValueError("GQA schedule task identities or dependencies differ from current graph")
+    queues = schedule.get("worker_task_queues")
+    if not isinstance(queues, list) or len(queues) != pk._num_sms():
+        raise ValueError("GQA schedule has wrong number of worker queues")
+    if any(not isinstance(q, list) or len(q) >= MAX_TASKS_PER_SM or
+           any(type(i) is not int or i < 0 or i >= len(tasks) for i in q) for q in queues):
+        raise ValueError("GQA schedule has invalid task indices or oversized queue")
+    plan_lists = [[(tasks[i].node, tasks[i].pos) for i in q] for q in queues]
+    if compiler.lists_of_gpu(tasks, nodes, plan_lists, pk._num_sms(), 0) != queues:
+        raise ValueError("GQA schedule queues do not match canonical tasks")
+    check_deadlock_free(expected, queues, compiler.concurrent_groups(tasks, nodes))
+
+
+def generate_code(pk, schedules: List[dict], profile: bool = False, cooperative_gqa: bool = False) -> str:
     """layer.cu for pk's graph and one schedule per GPU. All GPUs run the same kernel, so their nodes (grids, params) and number
     of SM lists must be the same; only their task tables differ. profile: the timing build (kernel_code)."""
     nodes = schedules[0]["nodes"]
+    if cooperative_gqa and (len(schedules) != 1 or profile or cluster_size(schedules) != 1):
+        raise ValueError("cooperative GQA requires one GPU, cluster size one, and no profiling")
+    if cooperative_gqa:
+        validate_gqa_schedule(pk, schedules)
     if len(schedules) != pk.num_gpus:
         raise ValueError(f"{len(schedules)} schedules, the graph is divided over {pk.num_gpus} GPUs (StaticMegakernel.num_gpus)")
     for g, schedule in enumerate(schedules):
@@ -361,7 +448,7 @@ def generate_code(pk, schedules: List[dict], profile: bool = False) -> str:
     lines += smem_code(nodes)
     lines += task_tables(schedules)
     lines += kernel_code(nodes, profile)
-    lines += host_code(pk, schedules, profile)
+    lines += host_code(pk, schedules, profile, cooperative_gqa)
     return "\n".join(lines)
 
 
@@ -664,6 +751,25 @@ static PyObject *py_launch(PyObject *self, PyObject *args) {
   static_launch((size_t)flush_bytes);
   Py_RETURN_NONE;
 }
+// Capture-safe entry point: no host reset/synchronization, one serving GPU.
+static PyObject *py_launch_on_stream(PyObject *self, PyObject *args) {
+#ifndef STATIC_RESET_IN_KERNEL
+  PyErr_SetString(PyExc_RuntimeError, "stream launch requires serving-mode device resets");
+  return NULL;
+#else
+  unsigned long long stream;
+  if (!PyArg_ParseTuple(args, "K", &stream)) return NULL;
+  if (static_mk::GPUS != 1) {
+    PyErr_SetString(PyExc_RuntimeError, "stream launch currently supports one GPU");
+    return NULL;
+  }
+  cudaStream_t saved = g_st[0].stream;
+  g_st[0].stream = reinterpret_cast<cudaStream_t>(stream);
+  static_launch(0);
+  g_st[0].stream = saved;
+  Py_RETURN_NONE;
+#endif
+}
 static PyObject *py_elapsed(PyObject *self, PyObject *args) {
   std::vector<float> us;
   cudaError_t const err = static_elapsed(us);
@@ -745,6 +851,7 @@ static PyMethodDef StaticMethods[] = {
   {"init_rank_func", py_init_rank, METH_VARARGS,
    "(rank, names, pointers, multicast address, local address): one GPU of the layer in a process of its own, the exchange region the caller's"},
   {"launch_func", py_launch, METH_VARARGS, "one launch on every GPU ([flush bytes]: serving mode, L2 emptied on the stream first)"},
+  {"launch_on_stream_func", py_launch_on_stream, METH_VARARGS, "one serving GPU on caller CUDA stream"},
   {"elapsed_func", py_elapsed, METH_NOARGS, "per GPU the microseconds between the events around the last launch's kernel"},
   {"set_device_func", py_set_device, METH_VARARGS, "(device): the CUDA device of GPU 0, before init_func"},
   {"launch_stream_func", py_launch_stream, METH_VARARGS, "(stream, pdl): one launch on the caller's stream (one GPU, serving build)"},
@@ -776,6 +883,10 @@ class StaticKernel:
         "serving": built with -DSTATIC_RESET_IN_KERNEL): the kernel resets its own buffers, no host step or wait; flush_bytes > 0:
         L2 emptied on each GPU's stream first, then the GPUs lined up (more than one), then the kernel."""
         self.module.launch_func(int(flush_bytes))
+
+    def launch_on_stream(self, stream):
+        """Internal serving entrypoint. Caller owns validation and tensor lifetime."""
+        self.module.launch_on_stream_func(int(stream.cuda_stream))
 
     def elapsed_us(self) -> List[float]:
         """Per GPU the microseconds between the events right before and after the last launch's kernel (after wait). In serving
@@ -838,9 +949,87 @@ def compile_command(cu_path: str, so_path: str, extra_flags: Optional[List[str]]
             + list(extra_flags or []))
 
 
+def task_compile_flags(used, extra_flags=None, implementation="portable"):
+    """Dependencies for tasks that reuse native persistent-kernel headers.
+
+    Keep other static tasks on their existing compile path. GQA is limited to
+    the partitioned Blackwell, eight-request implementation.
+    """
+    flags = list(extra_flags or [])
+    if any(name in used for name in ("gqa_paged_parts", "gqa_merge_ready", "gqa_direct")) and any("STATIC_NO_START_BARRIER" in flag for flag in flags):
+        raise ValueError("STATIC_NO_START_BARRIER is not validated for GQA")
+    if implementation not in ("portable", "sm100"):
+        raise ValueError("unknown GQA implementation")
+    sm100 = implementation == "sm100"
+    reserved = "MIRAGE_GQA_SM100_REQUEST_PARALLEL"
+    if "gqa_direct" in used or (any(n in used for n in ("gqa_paged_parts", "gqa_merge_ready")) and not sm100):
+        raise ValueError("only partitioned sm100 GQA is supported")
+    if sm100 and ("gqa_paged_parts" not in used or "gqa_merge_ready" not in used or "gqa_direct" in used):
+        raise ValueError("sm100 requires the partitioned GQA producer and merge")
+    if not sm100 and any(reserved in flag for flag in flags):
+        raise ValueError("request-parallel compile definition is reserved for sm100")
+    if "gqa_direct" not in used and not sm100:
+        return flags
+    label = "sm100 GQA"
+    from ..kernel import get_key_paths
+    _, include_path, deps_path = get_key_paths()
+    include_dirs = [os.path.join(include_path, "mirage", "persistent_kernel"),
+                    os.path.join(include_path, "mirage", "persistent_kernel", "tasks"),
+                    os.path.join(include_path, "mirage", "persistent_kernel", "tasks", "blackwell"),
+                    os.path.join(deps_path, "cutlass", "include"),
+                    os.path.join(deps_path, "cutlass", "tools", "util", "include")]
+    for directory in include_dirs:
+        if not os.path.isdir(directory):
+            raise FileNotFoundError(f"{label} compile dependency missing: {directory}")
+    standards, definitions, undefined = [], {}, set()
+    index = 0
+    while index < len(flags):
+        flag = flags[index]
+        option, value = None, None
+        if flag in ("-D", "--define-macro", "-U", "--undefine-macro", "-std", "--std"):
+            if index + 1 >= len(flags) or flags[index + 1].startswith("-"):
+                raise ValueError(f"missing value for {flag}")
+            option, value = flag, flags[index + 1]
+            index += 1
+        elif flag.startswith(("-std=", "--std=")):
+            option, value = "--std", flag.split("=", 1)[1]
+        elif flag.startswith(("--define-macro=", "--undefine-macro=")):
+            option, value = flag.split("=", 1)
+        elif flag.startswith(("-D", "-U")):
+            option, value = flag[:2], flag[2:]
+        if option in ("-std", "--std"):
+            standards.append(value)
+        elif option in ("-D", "--define-macro"):
+            for definition in value.split(","):
+                name, sep, setting = definition.partition("=")
+                definitions.setdefault(name, []).append(setting if sep else "1")
+        elif option in ("-U", "--undefine-macro"):
+            undefined.update(value.split(","))
+        index += 1
+    if any(standard != "c++20" for standard in standards):
+        raise ValueError(f"{label} requires C++20")
+    if not standards:
+        flags.append("-std=c++20")
+    required = {"MIRAGE_BACKEND_USE_CUDA": "1", "MIRAGE_GRACE_BLACKWELL": "1",
+                "MPK_ENABLE_TMA": "1", "MPK_MAX_NUM_BATCHED_REQUESTS": "8",
+                "MPK_MAX_NUM_BATCHED_TOKENS": "8"}
+    if sm100:
+        required[reserved] = "1"
+    for name, value in required.items():
+        if name in undefined or any(setting != value for setting in definitions.get(name, [])):
+            raise ValueError(f"{label} requires {name}={value}")
+        if name not in definitions:
+            flags.append(f"-D{name}={value}")
+    for directory in include_dirs:
+        flag = "-I" + directory
+        if flag not in flags:
+            flags.append(flag)
+    return flags
+
+
 def compile_static(pk, schedule_paths: List[str], gpu_tensors: Optional[List[dict]] = None, out_dir: Optional[str] = None,
                    extra_flags: Optional[List[str]] = None, profile: bool = False, device: int = 0, rank: Optional[int] = None,
-                   exchange: Optional[tuple] = None) -> StaticKernel:
+                   exchange: Optional[tuple] = None, cooperative_gqa: bool = False) -> StaticKernel:
     """  1. read the schedule files; write <out_dir>/layer.cu = generate_code
        2. nvcc it into a Python extension (compile_command) and load it
        3. init_func: every GPU's tensors (gpu_tensors[g] = {name: torch tensor on GPU g}) -> static_init -> static_host_init
@@ -856,6 +1045,32 @@ def compile_static(pk, schedule_paths: List[str], gpu_tensors: Optional[List[dic
     gpu_tensors = gpu_tensors or [dict(pk._model_tensors)]
     assert len(gpu_tensors) == (1 if rank is not None else num_gpus), "one tensor dict per GPU of this process"
     assert rank is None or (0 <= rank < num_gpus and exchange is not None), "rank: of the layer's GPUs, with the exchange region"
+    gqa_record = getattr(pk, "_paged_gqa_contract", None)
+    from .compiler import graph_nodes
+    gqa_nodes = graph_nodes(pk)
+    registered = [n for n in gqa_nodes if n.name in ("gqa_paged_parts", "gqa_merge_ready", "gqa_direct")]
+    has_gqa = bool(registered or gqa_record is not None)
+    if bool(cooperative_gqa) != has_gqa:
+        raise ValueError("GQA requires cooperative_gqa=True, which is only valid for GQA")
+    if cooperative_gqa and (profile or rank is not None or exchange is not None or num_gpus != 1):
+        raise ValueError("cooperative GQA requires one GPU, no rank/exchange, and no profiling")
+    if cooperative_gqa and any('STATIC_RESET_IN_KERNEL' in str(x) or 'STATIC_NO_START_BARRIER' in str(x) for x in (extra_flags or [])):
+        raise ValueError("GQA reset and barrier flags are managed by cooperative_gqa")
+    gqa_lease = None
+    if registered or gqa_record is not None:
+        if gqa_record is None or num_gpus != 1:
+            raise ValueError("experimental GQA requires its declared graph and one GPU")
+        # Retain a private mapping so caller dictionary edits cannot change the
+        # tensors validated, leased, passed to native init, or kept alive.
+        gpu_tensors = [dict(gpu_tensors[0])]
+        from .paged_gqa_bindings import validate_bound
+        validate_bound(pk, gpu_tensors[0])
+        from .paged_gqa_contract import validate_device
+        import torch
+        validate_device(gqa_record, torch.cuda.get_device_capability(0))
+
+    if gqa_record is not None and (rank is not None or num_gpus != 1 or int(device) != 0):
+        raise ValueError("GQA currently requires one GPU on device 0 without rank mode")
     out_dir = out_dir or os.path.dirname(os.path.abspath(schedule_paths[0]))
     os.makedirs(out_dir, exist_ok=True)
 
@@ -866,16 +1081,23 @@ def compile_static(pk, schedule_paths: List[str], gpu_tensors: Optional[List[dic
     cu_path = os.path.join(out_dir, "layer.cu")
     so_path = os.path.join(out_dir, "layer" + sysconfig.get_config_var("EXT_SUFFIX"))
     with open(cu_path, "w") as f:
-        f.write(generate_code(pk, schedules, profile))
+        f.write(generate_code(pk, schedules, profile, cooperative_gqa))
 
-    command = compile_command(cu_path, so_path, extra_flags)
-    cache = os.environ.get("MIRAGE_STATIC_BUILD_CACHE")
+    effective_flags = task_compile_flags(
+        [n.name for n in gqa_nodes], extra_flags,
+        gqa_record.get("implementation", "portable") if gqa_record else "portable")
+    if cooperative_gqa:
+        effective_flags = list(effective_flags) + ["-DSTATIC_RESET_IN_KERNEL=1"]
+    command = compile_command(cu_path, so_path, effective_flags)
+    # GQA transitively includes nested and external CUDA headers not covered
+    # by code_tag(); rebuild until the complete dependency closure is keyed.
+    cache = None if gqa_record is not None else os.environ.get("MIRAGE_STATIC_BUILD_CACHE")
     if cache:
         import fcntl
         os.makedirs(cache, exist_ok=True)
         with open(cu_path, "rb") as f:
             h = hashlib.md5(f.read())
-        h.update(" ".join(command[1:5] + list(extra_flags or [])).encode())   # -O3 .. the arch, the flags
+        h.update(" ".join(command[1:5] + list(effective_flags)).encode())   # -O3 .. the arch, the flags
         h.update(code_tag().encode())
         cached = os.path.join(cache, h.hexdigest() + sysconfig.get_config_var("EXT_SUFFIX"))
         with open(cached + ".lock", "w") as lock:
@@ -895,9 +1117,26 @@ def compile_static(pk, schedule_paths: List[str], gpu_tensors: Optional[List[dic
     spec = importlib.util.spec_from_file_location("__mirage_static_launcher", so_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module.set_device_func(int(device))
+    if gqa_record is not None:
+        from .paged_gqa_bindings import CacheLease, GuardedGQA, validate_bound
+        _, writers, readers = validate_bound(pk, gpu_tensors[0])
+        gqa_lease = CacheLease(writers, readers)
+        try:
+            current_ranges, current_writers, current_readers = validate_bound(pk, gpu_tensors[0])
+            if current_writers != writers or current_readers != readers:
+                raise ValueError("GQA bindings changed while acquiring lease")
+            names = [list(gpu_tensors[0])]
+            pointers = [[gpu_tensors[0][name].data_ptr() for name in names[0]]]
+            if any(current_ranges[name][1] != ptr for name, ptr in zip(names[0], pointers[0])):
+                raise ValueError("GQA pointers changed after validation")
+            module.init_func(names, pointers)
+            return GuardedGQA(StaticKernel(module, num_gpus, cu_path, so_path), pk, gpu_tensors[0], gqa_lease, cooperative=True)
+        except Exception:
+            gqa_lease.close()
+            raise
     names = [list(tensors.keys()) for tensors in gpu_tensors]
     pointers = [[t.data_ptr() for t in tensors.values()] for tensors in gpu_tensors]
-    module.set_device_func(int(device))
     if rank is None:
         module.init_func(names, pointers)
         return StaticKernel(module, num_gpus, cu_path, so_path)

@@ -270,6 +270,10 @@ public:
                                   std::vector<int> const &params);
   int register_hc_post_mix_sm100_task(threadblock::Graph const &bgraph,
                                       std::vector<int> const &params);
+  int register_gqa_paged_parts_sm100_task(threadblock::Graph const &bgraph,
+                                          std::vector<int> const &params);
+  int register_gqa_merge_ready_sm100_task(threadblock::Graph const &bgraph,
+                                          std::vector<int> const &params);
   // SM100 tasks end
   // Multi-GPU tasks
   int register_nvshmem_allgather_strided_put_task(
